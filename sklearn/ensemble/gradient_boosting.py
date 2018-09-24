@@ -45,6 +45,7 @@ from scipy.special import expit
 
 from time import time
 from ..model_selection import train_test_split
+from ..tree.tree import ExpertDecisionTreeRegressor
 from ..tree.tree import DecisionTreeRegressor
 from ..tree._tree import DTYPE
 from ..tree._tree import TREE_LEAF
@@ -1128,7 +1129,7 @@ class BaseGradientBoosting(six.with_metaclass(ABCMeta, BaseEnsemble)):
                  max_depth, min_impurity_decrease, min_impurity_split,
                  init, subsample, max_features,
                  random_state, alpha=0.9, verbose=0, max_leaf_nodes=None,
-                 warm_start=False, presort='auto',
+                 warm_start=False, expert_knowledge=False, presort='auto',
                  validation_fraction=0.1, n_iter_no_change=None,
                  tol=1e-4):
 
@@ -1150,10 +1151,59 @@ class BaseGradientBoosting(six.with_metaclass(ABCMeta, BaseEnsemble)):
         self.verbose = verbose
         self.max_leaf_nodes = max_leaf_nodes
         self.warm_start = warm_start
+        self.expert_knowledge = expert_knowledge
         self.presort = presort
         self.validation_fraction = validation_fraction
         self.n_iter_no_change = n_iter_no_change
         self.tol = tol
+
+    def _fit_expert_stage(self, i, X, y, y_pred, sample_weight, sample_mask,
+                   random_state, X_idx_sorted, X_csc=None, X_csr=None):
+        """Fit another stage of ``n_classes_`` trees to the boosting model. """
+
+        assert sample_mask.dtype == np.bool
+        loss = self.loss_
+        original_y = y
+
+        for k in range(loss.K):
+            if loss.is_multi_class:
+                y = np.array(original_y == k, dtype=np.float64)
+
+            residual = loss.negative_gradient(y, y_pred, k=k,
+                                              sample_weight=sample_weight)
+
+            # induce regression tree on residuals
+            tree = ExpertDecisionTreeRegressor(
+                criterion=self.criterion,
+                splitter='best',
+                max_depth=self.max_depth,
+                min_samples_split=self.min_samples_split,
+                min_samples_leaf=self.min_samples_leaf,
+                min_weight_fraction_leaf=self.min_weight_fraction_leaf,
+                min_impurity_decrease=self.min_impurity_decrease,
+                min_impurity_split=self.min_impurity_split,
+                max_features=self.max_features,
+                max_leaf_nodes=self.max_leaf_nodes,
+                random_state=random_state,
+                presort=self.presort)
+
+            if self.subsample < 1.0:
+                # no inplace multiplication!
+                sample_weight = sample_weight * sample_mask.astype(np.float64)
+
+            X = X_csr if X_csr is not None else X
+            tree.fit(X, residual, sample_weight=sample_weight,
+                     check_input=False, X_idx_sorted=X_idx_sorted)
+
+            # update tree leaves
+            loss.update_terminal_regions(tree.tree_, X, y, residual, y_pred,
+                                         sample_weight, sample_mask,
+                                         self.learning_rate, k=k)
+
+            # add tree to ensemble
+            self.estimators_[i, k] = tree
+
+        return y_pred
 
     def _fit_stage(self, i, X, y, y_pred, sample_weight, sample_mask,
                    random_state, X_idx_sorted, X_csc=None, X_csr=None):
@@ -1524,9 +1574,15 @@ class BaseGradientBoosting(six.with_metaclass(ABCMeta, BaseEnsemble)):
                                       sample_weight[~sample_mask])
 
             # fit next stage of trees
-            y_pred = self._fit_stage(i, X, y, y_pred, sample_weight,
-                                     sample_mask, random_state, X_idx_sorted,
-                                     X_csc, X_csr)
+            if i == 0 and self.expert_knowledge:
+                # print("Expert")
+                y_pred = self._fit_expert_stage(i, X, y, y_pred, sample_weight,
+                sample_mask, random_state, X_idx_sorted,
+                X_csc, X_csr)
+            else:
+                y_pred = self._fit_stage(i, X, y, y_pred, sample_weight,
+                 sample_mask, random_state, X_idx_sorted,
+                 X_csc, X_csr)
 
             # track deviance (= loss)
             if do_oob:
@@ -1938,7 +1994,7 @@ shape (n_estimators, ``loss_.K``)
                  max_depth=3, min_impurity_decrease=0.,
                  min_impurity_split=None, init=None,
                  random_state=None, max_features=None, verbose=0,
-                 max_leaf_nodes=None, warm_start=False,
+                 max_leaf_nodes=None, warm_start=False, expert_knowledge=False,
                  presort='auto', validation_fraction=0.1,
                  n_iter_no_change=None, tol=1e-4):
 
@@ -1953,8 +2009,8 @@ shape (n_estimators, ``loss_.K``)
             max_leaf_nodes=max_leaf_nodes,
             min_impurity_decrease=min_impurity_decrease,
             min_impurity_split=min_impurity_split,
-            warm_start=warm_start, presort=presort,
-            validation_fraction=validation_fraction,
+            warm_start=warm_start, expert_knowledge=expert_knowledge,
+            presort=presort, validation_fraction=validation_fraction,
             n_iter_no_change=n_iter_no_change, tol=tol)
 
     def _validate_y(self, y, sample_weight):
